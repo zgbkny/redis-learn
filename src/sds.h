@@ -29,7 +29,7 @@
 #define __SDS_H
 
 #include <sys/types.h>
-
+/* simple dynamic string */
 typedef char *sds;
 
 struct sdshdr {

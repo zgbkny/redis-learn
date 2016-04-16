@@ -32,10 +32,12 @@
 #include <string.h>
 #include <ctype.h>
 
+#ifdef SDS_ABORT_ON_OOM
 static void sdsOomAbort(void) {
     fprintf(stderr,"SDS: Out Of Memory (SDS_ABORT_ON_OOM defined)\n");
     abort();
 }
+#endif
 
 sds sdsnewlen(const void *init, size_t initlen) {
     struct sdshdr *sh;
@@ -177,6 +179,7 @@ sds sdscatprintf(sds s, const char *fmt, ...) {
     free(buf);
     return t;
 }
+
 
 sds sdstrim(sds s, const char *cset) {
     struct sdshdr *sh = (void*) (s-(sizeof(struct sdshdr)));

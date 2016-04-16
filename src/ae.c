@@ -15,19 +15,47 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+static int processTimeEvents(aeEventLoop *eventLoop);
+
 aeEventLoop *aeCreateEventLoop(void) {
     aeEventLoop *eventLoop;
+    int setsize = 1024;
+    int i;
 
     eventLoop = malloc(sizeof(*eventLoop));
-    if (!eventLoop) return NULL;
+    if (!eventLoop) goto err;
+    eventLoop->events = malloc(sizeof(aeFileEvent) * setsize);
+    eventLoop->fired = malloc(sizeof(aeFiredEvent) * setsize);
+    if (eventLoop->events == NULL || 
+        eventLoop->fired == NULL) goto err;
+        
+    eventLoop->setsize = setsize;
     eventLoop->fileEventHead = NULL;
     eventLoop->timeEventHead = NULL;
     eventLoop->timeEventNextId = 0;
     eventLoop->stop = 0;
+    eventLoop->maxfd = -1;
+    
+    if (aeApiCreate(eventLoop) == -1) goto err;
+    for (i = 0; i < setsize; i++) {
+        eventLoop->events[i].mask = AE_NONE;
+    }
     return eventLoop;
+    
+err:
+    if (eventLoop) {
+        free(eventLoop->events);
+        free(eventLoop->fired);
+        free(eventLoop);
+    }
+    return NULL;
 }
 
+
 void aeDeleteEventLoop(aeEventLoop *eventLoop) {
+    aeApiFree(eventLoop);
+    free(eventLoop->events);
+    free(eventLoop->fired);
     free(eventLoop);
 }
 
@@ -36,41 +64,44 @@ void aeStop(aeEventLoop *eventLoop) {
 }
 
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
-        aeFileProc *proc, void *clientData,
-        aeEventFinalizerProc *finalizerProc)
+        aeFileProc *proc, void *clientData)
 {
-    aeFileEvent *fe;
-
-    fe = malloc(sizeof(*fe));
-    if (fe == NULL) return AE_ERR;
-    fe->fd = fd;
+    if (fd >= eventLoop->setsize) {
+        errno = ERANGE;
+        return AE_ERR;
+    }
+    
+    aeFileEvent *fe = &eventLoop->events[fd];
+    
+    if (aeApiAddEvent(eventLoop, fd, mask) == -1)
+        return AE_ERR;
+        
+    
     fe->mask = mask;
-    fe->fileProc = proc;
-    fe->finalizerProc = finalizerProc;
+    if (mask & AE_READABLE) fe->rfileProc = proc;
+    if (mask & AE_WRITABLE) fe->wfileProc = proc;
     fe->clientData = clientData;
-    fe->next = eventLoop->fileEventHead;
-    eventLoop->fileEventHead = fe;
+    if (fd > eventLoop->maxfd)
+        eventLoop->maxfd = fd;
     return AE_OK;
 }
 
 void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
 {
-    aeFileEvent *fe, *prev = NULL;
+    if (fd >= eventLoop->setsize) return;
+    aeFileEvent *fe = &eventLoop->events[fd];
+    if (fe->mask == AE_NONE) return;
+    
+    aeApiDelEvent(eventLoop, fd, mask);
 
-    fe = eventLoop->fileEventHead;
-    while(fe) {
-        if (fe->fd == fd && fe->mask == mask) {
-            if (prev == NULL)
-                eventLoop->fileEventHead = fe->next;
-            else
-                prev->next = fe->next;
-            if (fe->finalizerProc)
-                fe->finalizerProc(eventLoop, fe->clientData);
-            free(fe);
-            return;
+    fe->mask = fe->mask & (~mask);
+    if (fd == eventLoop->maxfd && fe->mask == AE_NONE) {
+        int j;
+        
+        for (j = eventLoop->maxfd-1; j >= 0; j--) {
+            if (eventLoop->events[j].mask != AE_NONE) break;
         }
-        prev = fe;
-        fe = fe->next;
+        eventLoop->maxfd = j;
     }
 }
 
@@ -159,6 +190,75 @@ static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
     return nearest;
 }
 
+/* Process time events */
+static int processTimeEvents(aeEventLoop *eventLoop) {
+    int processed = 0;
+    aeTimeEvent *te;
+    long long maxId;
+    time_t now = time(NULL);
+
+    /* If the system clock is moved to the future, and then set back to the
+     * right value, time events may be delayed in a random way. Often this
+     * means that scheduled operations will not be performed soon enough.
+     *
+     * Here we try to detect system clock skews, and force all the time
+     * events to be processed ASAP when this happens: the idea is that
+     * processing events earlier is less dangerous than delaying them
+     * indefinitely, and practice suggests it is. */
+    if (now < eventLoop->lastTime) {
+        te = eventLoop->timeEventHead;
+        while(te) {
+            te->when_sec = 0;
+            te = te->next;
+        }
+    }
+    eventLoop->lastTime = now;
+
+    te = eventLoop->timeEventHead;
+    maxId = eventLoop->timeEventNextId-1;
+    while(te) {
+        long now_sec, now_ms;
+        long long id;
+
+        if (te->id > maxId) {
+            te = te->next;
+            continue;
+        }
+        aeGetTime(&now_sec, &now_ms);
+        if (now_sec > te->when_sec ||
+            (now_sec == te->when_sec && now_ms >= te->when_ms))
+        {
+            int retval;
+
+            id = te->id;
+            retval = te->timeProc(eventLoop, id, te->clientData);
+            processed++;
+            /* After an event is processed our time event list may
+             * no longer be the same, so we restart from head.
+             * Still we make sure to don't process events registered
+             * by event handlers itself in order to don't loop forever.
+             * To do so we saved the max ID we want to handle.
+             *
+             * FUTURE OPTIMIZATIONS:
+             * Note that this is NOT great algorithmically. Redis uses
+             * a single time event so it's not a problem but the right
+             * way to do this is to add the new elements on head, and
+             * to flag deleted elements in a special way for later
+             * deletion (putting references to the nodes to delete into
+             * another linked list). */
+            if (retval != AE_NOMORE) {
+                aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
+            } else {
+                aeDeleteTimeEvent(eventLoop, id);
+            }
+            te = eventLoop->timeEventHead;
+        } else {
+            te = te->next;
+        }
+    }
+    return processed;
+}
+
 /* Process every pending time event, then every pending file event
  * (that may be registered by time event callbacks just processed).
  * Without special flags the function sleeps until some file event
@@ -174,37 +274,18 @@ static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
  * The function returns the number of events processed. */
 int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 {
-    int maxfd = 0, numfd = 0, processed = 0;
-    fd_set rfds, wfds, efds;
-    aeFileEvent *fe = eventLoop->fileEventHead;
-    aeTimeEvent *te;
-    long long maxId;
-    AE_NOTUSED(flags);
-
+    int processed = 0, numevents;
+    
     /* Nothing to do? return ASAP */
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
 
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-    FD_ZERO(&efds);
-
-    /* Check file events */
-    if (flags & AE_FILE_EVENTS) {
-        while (fe != NULL) {
-            if (fe->mask & AE_READABLE) FD_SET(fe->fd, &rfds);
-            if (fe->mask & AE_WRITABLE) FD_SET(fe->fd, &wfds);
-            if (fe->mask & AE_EXCEPTION) FD_SET(fe->fd, &efds);
-            if (maxfd < fe->fd) maxfd = fe->fd;
-            numfd++;
-            fe = fe->next;
-        }
-    }
+        
     /* Note that we want call select() even if there are no
      * file events to process as long as we want to process time
      * events, in order to sleep until the next time event is ready
      * to fire. */
-    if (numfd || ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
-        int retval;
+    if (eventLoop->maxfd != -1 || ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
+        int j;
         aeTimeEvent *shortest = NULL;
         struct timeval tv, *tvp;
 
@@ -224,6 +305,8 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             } else {
                 tvp->tv_usec = (shortest->when_ms - now_ms)*1000;
             }
+            if (tvp->tv_sec < 0) tvp->tv_sec = 0;
+            if (tvp->tv_usec < 0) tvp->tv_usec = 0;
         } else {
             /* If we have to check for events but need to return
              * ASAP because of AE_DONT_WAIT we need to se the timeout
@@ -236,76 +319,31 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
                 tvp = NULL; /* wait forever */
             }
         }
+        numevents = aeApiPoll(eventLoop, tvp);
+        for (j = 0; j < numevents; j++) {
+            aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
+            int mask = eventLoop->fired[j].mask;
+            int fd = eventLoop->fired[j].fd;
+            int rfired = 0;
 
-        retval = select(maxfd+1, &rfds, &wfds, &efds, tvp);
-        if (retval > 0) {
-            fe = eventLoop->fileEventHead;
-            while(fe != NULL) {
-                int fd = (int) fe->fd;
-
-                if ((fe->mask & AE_READABLE && FD_ISSET(fd, &rfds)) ||
-                    (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds)) ||
-                    (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds)))
-                {
-                    int mask = 0;
-
-                    if (fe->mask & AE_READABLE && FD_ISSET(fd, &rfds))
-                        mask |= AE_READABLE;
-                    if (fe->mask & AE_WRITABLE && FD_ISSET(fd, &wfds))
-                        mask |= AE_WRITABLE;
-                    if (fe->mask & AE_EXCEPTION && FD_ISSET(fd, &efds))
-                        mask |= AE_EXCEPTION;
-                    fe->fileProc(eventLoop, fe->fd, fe->clientData, mask);
-                    processed++;
-                    /* After an event is processed our file event list
-                     * may no longer be the same, so what we do
-                     * is to clear the bit for this file descriptor and
-                     * restart again from the head. */
-                    fe = eventLoop->fileEventHead;
-                    FD_CLR(fd, &rfds);
-                    FD_CLR(fd, &wfds);
-                    FD_CLR(fd, &efds);
-                } else {
-                    fe = fe->next;
-                }
+	        /* note the fe->mask & mask & ... code: maybe an already processed
+             * event removed an element that fired and we still didn't
+             * processed, so we check if the event is still valid. */
+            if (fe->mask & mask & AE_READABLE) {
+                rfired = 1;
+                fe->rfileProc(eventLoop,fd,fe->clientData,mask);
             }
+            if (fe->mask & mask & AE_WRITABLE) {
+                if (!rfired || fe->wfileProc != fe->rfileProc)
+                    fe->wfileProc(eventLoop,fd,fe->clientData,mask);
+            }
+            processed++;
         }
+        
     }
     /* Check time events */
     if (flags & AE_TIME_EVENTS) {
-        te = eventLoop->timeEventHead;
-        maxId = eventLoop->timeEventNextId-1;
-        while(te) {
-            long now_sec, now_ms;
-            long long id;
-
-            if (te->id > maxId) {
-                te = te->next;
-                continue;
-            }
-            aeGetTime(&now_sec, &now_ms);
-            if (now_sec > te->when_sec ||
-                (now_sec == te->when_sec && now_ms >= te->when_ms))
-            {
-                int retval;
-
-                id = te->id;
-                retval = te->timeProc(eventLoop, id, te->clientData);
-                /* After an event is processed our time event list may
-                 * no longer be the same, so we restart from head.
-                 * Still we make sure to don't process events registered
-                 * by event handlers itself in order to don't loop forever.
-                 * To do so we saved the max ID we want to handle. */
-                if (retval != AE_NOMORE) {
-                    aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
-                } else {
-                    aeDeleteTimeEvent(eventLoop, id);
-                }
-                te = eventLoop->timeEventHead;
-            } else {
-                te = te->next;
-            }
-        }
+        processed += processTimeEvents(eventLoop);
     }
     return processed; /* return the number of processed file/time events */
 }

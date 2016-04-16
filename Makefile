@@ -1,42 +1,57 @@
-# Makefile for wbox
-# Copyright (C) 2007 Salvatore Sanfilippo <antirez@invece.org>
-# All Rights Reserved
-# Under the GPL license version 2
+EXECUTABLE :=  redis-server 							        # 可执行文件名
+LIBDIR := #src/lib/libst.a           							# 静态库目录
+LIBS :=  pthread crypt z    					    # 静态库文件名
+INCLUDES:= . src 		# 头文件目录
+SRCDIR:= src   			    # 除了当前目录外，其他的源代码文件目录
+TEST := redis-server
 
-DEBUG?= -g
-CFLAGS?= -O2 -Wall -W -DSDS_ABORT_ON_OOM
-CCOPT= $(CFLAGS)
+RM-F := rm -f
 
-OBJ = adlist.o ae.o anet.o dict.o redis.o sds.o picol.o
-PRGNAME = redis-server
+CC:=gcc
+CFLAGS := -g -Wall -O3
+CPPFLAGS := $(CFLAGS)
+CPPFLAGS += $(addprefix -I,$(INCLUDES))
+CPPFLAGS += -MMD
 
-all: redis-server
+# # You shouldn't need to change anything below this point.
+#
+SRCS := $(wildcard *.c) $(wildcard $(addsuffix /*.c, $(SRCDIR))) #list all *.cc in the current dir and SRCDIR
+OBJS := $(patsubst %.c, %.o, $(SRCS)) # alt cc to o in SRCS, patsubst is a function
+DEPS := $(patsubst %.o, %.d, $(OBJS)) #alt o to d in OBJS
+MISSING_DEPS := $(filter-out $(wildcard $(DEPS)),$(DEPS)) #remove $(wildcard $(DEPS)) from $(DEPS) then return
+MISSING_DEPS_SOURCES := $(wildcard $(patsubst %.d,%.c,$(MISSING_DEPS))) #alt missing *.d to *.cc
 
-# Deps (use make dep to generate this)
-src/picol.o: src/picol.c src/picol.h
-src/adlist.o: src/adlist.c src/adlist.h
-src/ae.o: src/ae.c src/ae.h
-src/anet.o: src/anet.c src/anet.h
-src/dict.o: src/dict.c src/dict.h
-src/redis.o: src/redis.c src/ae.h src/sds.h src/anet.h src/dict.h src/adlist.h
-src/sds.o: src/sds.c src/sds.h
 
-redis-server: $(OBJ)
-	$(CC) -o $(PRGNAME) $(CCOPT) $(DEBUG) $(OBJ)
-	@echo ""
-	@echo "Hint: To run the test-redis.tcl script is a good idea."
-	@echo "Launch the redis server with ./redis-server, then in another"
-	@echo "terminal window enter this directory and run 'make test'."
-	@echo ""
+.PHONY : all deps objs clean veryclean rebuild info
 
-c.o:
-	$(CC) -c $(CCOPT) $(DEBUG) $(COMPILE_TIME) $<
+all: $(EXECUTABLE)
+
+deps: $(DEPS)
+
+objs: $(OBJS)
 
 clean:
-	rm -rf $(PRGNAME) *.o
+	@$(RM-F) $(OBJS)
+	@$(RM-F) $(DEPS)
 
-dep:
-	$(CC) -MM *.c
+veryclean: clean
+	@$(RM-F) $(EXECUTABLE)
 
-test:
-	tclsh test-redis.tcl
+rebuild: veryclean all
+ifneq ($(MISSING_DEPS),)
+$(MISSING_DEPS) :
+	@$(RM-F) $(patsubst %.d,%.o,$@)
+endif
+-include $(DEPS)
+$(EXECUTABLE): $(OBJS)
+	$(CC) -o $(EXECUTABLE) $(OBJS)  $(LIBDIR) $(addprefix -l,$(LIBS)) 
+
+$(OBJS):%.o:%.c
+	$(CC) $(CPPFLAGS) -o $@ -c $< 
+ 
+info:
+	@echo $(SRCS)
+	@echo $(OBJS)
+	@echo $(DEPS)
+	@echo $(MISSING_DEPS)
+	@echo $(MISSING_DEPS_SOURCES)

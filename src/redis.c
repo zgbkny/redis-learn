@@ -910,7 +910,7 @@ static int createClient(int fd) {
     if ((c->reply = listCreate()) == NULL) oom("listCreate");
     listSetFreeMethod(c->reply,decrRefCount);
     if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
-        readQueryFromClient, c, NULL) == AE_ERR) {
+        readQueryFromClient, c) == AE_ERR) {
         freeClient(c);
         return REDIS_ERR;
     }
@@ -921,7 +921,7 @@ static int createClient(int fd) {
 static void addReply(redisClient *c, robj *obj) {
     if (listLength(c->reply) == 0 &&
         aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
-        sendReplyToClient, c, NULL) == AE_ERR) return;
+        sendReplyToClient, c) == AE_ERR) return;
     if (!listAddNodeTail(c->reply,obj)) oom("listAddNodeTail");
     incrRefCount(obj);
 }
@@ -1788,7 +1788,7 @@ int main(int argc, char **argv) {
     if (loadDb("dump.rdb") == REDIS_OK)
         redisLog(REDIS_NOTICE,"DB loaded from disk");
     if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
-        acceptHandler, NULL, NULL) == AE_ERR) oom("creating file event");
+        acceptHandler, NULL) == AE_ERR) oom("creating file event");
     redisLog(REDIS_NOTICE,"The server is now ready to accept connections");
     aeMain(server.el);
     aeDeleteEventLoop(server.el);

@@ -69,6 +69,7 @@ int aeApiDelEvent(aeEventLoop *eventLoop, int fd, int delmask) {
     } else {
         epoll_ctl(state->epfd, EPOLL_CTL_DEL, fd, &ee);
     }
+    return 0;
 }
 
 

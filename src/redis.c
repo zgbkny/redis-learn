@@ -623,7 +623,6 @@ int processCommand(redisClient *c) {
     } 
     /* Exec the command */
     cmd->proc(c);
-    resetClient(c);
     return 1;
 }
 
@@ -706,6 +705,7 @@ again:
              * after processCommand() return and there is something
              * on the query buffer try to process the next command. */
             if (processCommand(c) && sdslen(c->querybuf)) goto again;
+            resetClient(c);
             return;
         } else if (sdslen(c->querybuf) >= 1024) {
             redisLog(REDIS_DEBUG, "Client protocol error");
@@ -721,10 +721,11 @@ again:
 
         if (c->bulklen <= qbl) {
             /* Copy everything but the final CRLF as final argument */
-            c->argv[c->argc] = sdsnewlen(c->querybuf,c->bulklen-2);
+            c->argv[c->argc] = sdsnewlen(c->querybuf, c->bulklen-2);
             c->argc++;
-            c->querybuf = sdsrange(c->querybuf,c->bulklen,-1);
+            c->querybuf = sdsrange(c->querybuf, c->bulklen, -1);
             processCommand(c);
+            resetClient(c);
             return;
         }
     }

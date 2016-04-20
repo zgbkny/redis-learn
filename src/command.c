@@ -13,6 +13,7 @@ void pingCommand(redisClient *c) {
 }
 
 void echoCommand(redisClient *c) {
+    redisLog(REDIS_DEBUG, "echoCommand");
     addReplySds(c,sdscatprintf(sdsempty(),"%d\r\n",(int)sdslen(c->argv[1])));
     addReplySds(c,c->argv[1]);
     addReply(c,shared.crlf);

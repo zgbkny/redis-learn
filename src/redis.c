@@ -598,6 +598,7 @@ void resetClient(redisClient *c) {
  * and other operations can be performed by the caller. Otherwise
  * if 0 is returned the client was destroied (i.e. after QUIT). */
 int processCommand(redisClient *c) {
+    redisLog(REDIS_DEBUG, "processCommand");
     struct redisCommand *cmd;
 
     sdstolower(c->argv[0]);
@@ -608,38 +609,18 @@ int processCommand(redisClient *c) {
         return 0;
     }
     cmd = lookupCommand(c->argv[0]);
+    
     if (!cmd) {
         addReplySds(c,sdsnew("-ERR unknown command\r\n"));
         resetClient(c);
         return 1;
-    } else if (cmd->arity != c->argc) {
+    } 
+    redisLog(REDIS_DEBUG, "processCommand cmd name:%s, argv len:%d", cmd->name, c->argc);
+    if (cmd->arity != c->argc) {
         addReplySds(c,sdsnew("-ERR wrong number of arguments\r\n"));
         resetClient(c);
         return 1;
-    } else if (cmd->type == REDIS_CMD_BULK && c->bulklen == -1) {
-        int bulklen = atoi(c->argv[c->argc-1]);
-
-        sdsfree(c->argv[c->argc-1]);
-        if (bulklen < 0 || bulklen > 1024*1024*1024) {
-            c->argc--;
-            c->argv[c->argc] = NULL;
-            addReplySds(c,sdsnew("-ERR invalid bulk write count\r\n"));
-            resetClient(c);
-            return 1;
-        }
-        c->argv[c->argc-1] = NULL;
-        c->argc--;
-        c->bulklen = bulklen+2; /* add two bytes for CR+LF */
-        /* It is possible that the bulk read is already in the
-         * buffer. Check this condition and handle it accordingly */
-        if ((signed)sdslen(c->querybuf) >= c->bulklen) {
-            c->argv[c->argc] = sdsnewlen(c->querybuf,c->bulklen-2);
-            c->argc++;
-            c->querybuf = sdsrange(c->querybuf,c->bulklen,-1);
-        } else {
-            return 1;
-        }
-    }
+    } 
     /* Exec the command */
     cmd->proc(c);
     resetClient(c);
@@ -676,9 +657,6 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     } else {
         return;
     }
-    
-    redisLog(REDIS_DEBUG, "readQueryFromClient return %s", c->querybuf);  
-    return;
 
 again:
      
@@ -707,9 +685,14 @@ again:
                 sdsfree(query);
                 return;
             }
-            argv = sdssplitlen(query,sdslen(query)," ",1,&argc);
+            argv = sdssplitlen(query, sdslen(query), " ", 1, &argc);
             sdsfree(query);
             if (argv == NULL) oom("Splitting query in token");
+            
+            /**
+             * 假如命令是：  echo hello
+             * 那么处理的结果就是：c->argv[0] = "echo", c->argv[1] = "hello"
+             **/
             for (j = 0; j < argc && j < REDIS_MAX_ARGS; j++) {
                 if (sdslen(argv[j])) {
                     c->argv[c->argc] = argv[j];
@@ -718,7 +701,7 @@ again:
                     sdsfree(argv[j]);
                 }
             }
-            free(argv);
+            free(argv); // 删除"\0"防止内存泄漏
             /* Execute the command. If the client is still valid
              * after processCommand() return and there is something
              * on the query buffer try to process the next command. */
@@ -871,7 +854,6 @@ void decrRefCount(void *obj) {
 
 
 /* =================================== Main! ================================ */
-
 int main(int argc, char **argv) {
     initServerConfig();
     initServer();
